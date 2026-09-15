@@ -251,12 +251,16 @@ def cmd_check_weak(current_password, wordlist):
     return False
 
 def cmd_crack(ssid, wordlist, target_password=None, target_pmk=None,
-              jobs=None, resume_from=0, batch_size=400, ack=False):
+              jobs=None, resume_from=0, batch_size=400, ack=False, show_each=False):
     """
-    Persistent CPU crack (lab simulation of YOUR OWN password).
-    Computes target PMK from your own known password, then streams the
-    wordlist with multiprocessing until the password is FOUND.
+    LAB DEMO: persistent CPU engine proving speed/persistence using YOUR OWN
+    known password. It does NOT touch the real AP and does NOT recover an
+    unknown password — for that use 'audit' with a handshake capture
+    (--cap/--hc22000) from your own router. Computes the target PMK from the
+    given known password, then streams the wordlist until that entry is FOUND.
     Never stops after 'a few attempts' — only on FOUND / exhausted / Ctrl+C.
+    show_each=True logs every candidate: [line/total] 'password' -> WRONG,
+    and -> CORRECT on the hit (slower due to I/O, but fully transparent).
     """
     if not ack:
         fail(f"Confirm ownership: pass {LEGAL_ACK} (your own network/lab only).")
@@ -269,8 +273,10 @@ def cmd_crack(ssid, wordlist, target_password=None, target_pmk=None,
                                          ssid.encode(), 4096, 32).hex()
     jobs = jobs or multiprocessing.cpu_count()
     total = count_lines(wordlist)
-    print(f"[*] crack start: ssid={ssid} total={total} jobs={jobs} batch={batch_size} resume={resume_from}")
+    print(f"[*] crack start: ssid={ssid} total={total} jobs={jobs} batch={batch_size} resume={resume_from} show_each={show_each}")
     print(f"[*] target_pmk={target_pmk[:16]}... | runs until FOUND or EOF. Ctrl+C to pause (checkpoint saved).")
+    if show_each:
+        print("[*] show_each ON: every candidate is logged as [line/total] 'password' -> WRONG/CORRECT.")
     t0 = time.time()
 
     def save_ckpt(n):
@@ -290,6 +296,7 @@ def cmd_crack(ssid, wordlist, target_password=None, target_pmk=None,
             def check_ordered_blocking():
                 """Check oldest futures in order; return password if found."""
                 nonlocal tested, found
+                buf = []  # per-candidate lines for show_each (flushed per batch)
                 # wait in submission order so line numbers / resume stay correct
                 for fut, start, blen in list(inflight):
                     try:
@@ -300,21 +307,36 @@ def cmd_crack(ssid, wordlist, target_password=None, target_pmk=None,
                         save_ckpt(tested)
                         continue
                     for i, (pw, pmk) in enumerate(res):
+                        lineno = start + i
                         if pmk == target_pmk:
-                            lineno = start + i
                             dt = time.time() - t0
-                            print(f"\n[+] PASSWORD FOUND: '{pw}'  (line {lineno}/{total}, {dt:.1f}s, {lineno/dt:.0f} keys/s)")
+                            wrong = lineno - 1 - resume_from  # wrong tries this run
+                            if show_each and buf:
+                                print("\n".join(buf), flush=True)
+                                buf.clear()
+                            if show_each:
+                                print(f"[{lineno}/{total}] '{pw}' -> CORRECT", flush=True)
+                            print(f"\n[+] CORRECT after {wrong} wrong tries: '{pw}'  (line {lineno}/{total}, {dt:.1f}s)")
                             save_ckpt(lineno)
                             for f2, _, _ in inflight:
                                 f2.cancel()
                             ex.shutdown(wait=False, cancel_futures=True)
                             return pw
+                        elif show_each:
+                            buf.append(f"[{lineno}/{total}] '{pw}' -> WRONG")
+                    if show_each and buf:
+                        print("\n".join(buf), flush=True)
+                        buf.clear()
                     tested = start + blen - 1
                     save_ckpt(tested)
                     el = time.time() - t0
                     rate = (tested - resume_from) / el if el > 0 else 0
                     eta = (total - tested) / rate if rate > 0 else 0
-                    print(f"\r[*] {tested}/{total} ({100*tested/max(total,1):.1f}%) {rate:.0f} keys/s ETA {eta/60:.1f}m", end="", flush=True)
+                    if show_each:
+                        print(f"[*] tried {tested} wrong... ({tested}/{total}, {100*tested/max(total,1):.1f}%) {rate:.0f} keys/s ETA {eta/60:.1f}m", flush=True)
+                    else:
+                        # light single-line counter: no per-password spam, ~zero memory
+                        print(f"\r[*] tried {tested} wrong... ({tested}/{total}, {100*tested/max(total,1):.1f}%) {rate:.0f} keys/s", end="", flush=True)
                 inflight.clear()
                 return None
 
@@ -352,32 +374,102 @@ def cmd_crack(ssid, wordlist, target_password=None, target_pmk=None,
     print(f"\n[-] Exhausted {total} passwords, not found. Try bigger wordlist / rules. Checkpoint={tested}")
     return None
 
-def cmd_audit(ssid, cap, hc22000, wordlist, jobs, use_gpu, show, ack):
-    if not ack:
-        fail(f"You must pass {LEGAL_ACK}.")
-    tools, gpu = detect_tools()
-    print(f"[*] tools={tools}\n[*] gpu:\n{gpu[:1500]}")
+CAPTURE_HELP = """No usable handshake found. To REALLY test your OWN WiFi password you need
+a handshake capture from YOUR OWN access point first (WPA2 cannot be tested
+from SSID alone — the SSID is not secret):
+  1. sudo airmon-ng start wlan0
+  2. sudo airodump-ng -c <channel> --bssid <your_AP_MAC> -w myown wlan0mon
+     (reconnect one of YOUR OWN devices so the 4-way handshake is captured;
+      never deauth other people's devices)
+  3. Convert: hcxpcapngtool -o myown.hc22000 myown-01.cap
+  4. Audit:  wa9 audit --hc22000 myown.hc22000 --wordlist rockyou.txt --use-gpu auto --i-own-this-network
+Lab shortcut (no WiFi hardware): 'crack' with --target-password replays YOUR OWN
+known password through the engine to prove speed/persistence."""
+
+def validate_handshake(path, kind=None):
+    """Check an offline capture is usable before burning CPU/GPU hours.
+
+    Returns (ok: bool, msg: str). Never runs attacks; only reads file headers.
+    kind: 'cap' | 'hc22000' | None (auto-detect by extension/content).
+    """
+    if not path:
+        return False, "no file given. " + CAPTURE_HELP
+    if not os.path.isfile(path):
+        return False, f"file not found: {path}. " + CAPTURE_HELP
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        return False, f"cannot stat {path}: {e}"
+    if size == 0:
+        return False, f"{path} is empty (0 bytes). Re-capture from YOUR OWN AP. " + CAPTURE_HELP
+    ext = os.path.splitext(path)[1].lower()
+    if kind is None:
+        kind = "hc22000" if ext == ".hc22000" else "cap"
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+    except OSError as e:
+        return False, f"cannot read {path}: {e}"
+    if kind == "hc22000":
+        try:
+            text = head.decode(errors="strict")
+        except UnicodeDecodeError:
+            return False, f"{path} is binary, not a hashcat 22000 text file. Convert YOUR OWN .cap with: hcxpcapngtool -o out.hc22000 in.cap"
+        first = text.splitlines()[0] if text.splitlines() else ""
+        if "WPA*" not in first and first.count("*") < 3:
+            return False, (f"{path} does not look like hashcat mode 22000 (first line should contain WPA* fields). "
+                           f"Convert YOUR OWN .cap with: hcxpcapngtool -o out.hc22000 in.cap")
+        return True, f"{path}: looks like hashcat 22000 ({size} bytes)."
+    # .cap / .pcap / .pcapng: check magic bytes (classic pcap or pcapng)
+    magics = (b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x0a\x0d\x0d\x0a")
+    if not any(head.startswith(m) for m in magics):
+        return False, (f"{path} is not a pcap/pcapng capture (bad magic). "
+                       f"Capture YOUR OWN AP with airodump-ng, or convert to .hc22000 first.")
+    if size < 1000:
+        return False, (f"{path} is suspiciously small ({size} bytes) — probably no handshake inside. "
+                       f"Re-capture while one of YOUR OWN devices (re)connects. " + CAPTURE_HELP)
+    return True, f"{path}: pcap magic OK ({size} bytes). NOTE: magic alone can't prove a full 4-way handshake is inside — aircrack/hashcat will report 'no handshake' if missing."
+
+def build_audit_command(ssid, cap, hc22000, wordlist, use_gpu, show, tools=None):
+    """Shared command builder for CLI + GUI. Returns (cmd, note) or raises SystemExit via fail()."""
+    tools = tools or dict(detect_tools()[0])
     if hc22000:
-        if not tools["hashcat"]:
-            fail("Install hashcat: sudo apt install hashcat")
+        ok, msg = validate_handshake(hc22000, "hc22000")
+        if not ok:
+            fail(msg)
+        if not tools.get("hashcat"):
+            fail("hashcat not found. Install: sudo apt install hashcat")
         dev = "1,2" if use_gpu == "auto" else ("2" if use_gpu == "yes" else "1")
         cmd = [tools["hashcat"], "-m", "22000", "-a", "0", "-D", dev,
                "--status", "--status-timer", "5", hc22000, wordlist]
-        if show: cmd.append("--show")
-        print(f"[*] hashcat runs until cracked/exhausted (persistent, Ctrl+C to quit): {' '.join(cmd)}")
-        print("[*] Convert your OWN capture: hcxpcapngtool -o out.hc22000 in.cap")
-        subprocess.run(cmd)  # hashcat itself is persistent; no early stop
-        return
+        if show:
+            cmd.append("--show")
+        return cmd, "hashcat runs until cracked/exhausted (persistent, Ctrl+C to quit)."
     if cap:
-        if not tools["aircrack-ng"]:
-            fail("Install aircrack-ng: sudo apt install aircrack-ng (or use --hc22000 + hashcat)")
-        if not ssid: fail("--ssid required for .cap")
-        # Single persistent aircrack run over FULL file (no split = no early-stop bug)
+        ok, msg = validate_handshake(cap, "cap")
+        if not ok:
+            fail(msg)
+        if not tools.get("aircrack-ng"):
+            fail("aircrack-ng not found. Install: sudo apt install aircrack-ng (or use --hc22000 + hashcat)")
+        if not ssid:
+            fail("--ssid required for .cap")
         cmd = [tools["aircrack-ng"], cap, "-w", wordlist, "-e", ssid]
-        print(f"[*] aircrack runs full wordlist until KEY FOUND (persistent): {' '.join(cmd)}")
-        subprocess.run(cmd)
-        return
+        return cmd, "aircrack runs full wordlist until KEY FOUND (persistent)."
     fail("Provide --cap OWN.cap or --hc22000 OWN.hc22000 from your own router.")
+
+def cmd_audit(ssid, cap, hc22000, wordlist, jobs, use_gpu, show, ack):
+    if not ack:
+        fail(f"You must pass {LEGAL_ACK}.")
+    if not wordlist or not os.path.isfile(wordlist):
+        fail(f"wordlist not found: {wordlist}")
+    tools, gpu = detect_tools()
+    print(f"[*] tools={tools}\n[*] gpu:\n{gpu[:1500]}")
+    cmd, note = build_audit_command(ssid, cap, hc22000, wordlist, use_gpu, show, tools)
+    print(f"[*] {note}: {' '.join(cmd)}")
+    if hc22000:
+        print("[*] Get .hc22000 from YOUR OWN capture: hcxpcapngtool -o out.hc22000 in.cap")
+    subprocess.run(cmd)  # hashcat/aircrack themselves are persistent; no early stop
+    return
 
 # --- interactive terminal shell ---
 SHELL_HELP = """commands:
@@ -386,7 +478,7 @@ SHELL_HELP = """commands:
   wifilist                      scan nearby APs (passive)
   test                          vuln assessment for set ssid (advanced, passive)
   benchmark [N]                 speed test (default 2000)
-  set ssid NAME | wordlist F | jobs N | target PASS | cap F | hc22000 F | gpu auto|yes|no
+  set ssid NAME | wordlist F | jobs N | target PASS | cap F | hc22000 F | gpu auto|yes|no | showeach on|off
   show                          current settings
   check                         is target in wordlist? (fast, no crypto)
   start                         persistent crack until FOUND (CPU, lab simulation)
@@ -397,7 +489,7 @@ notes: start/audit never stop after a few tries — only FOUND / exhausted / Ctr
 
 def cmd_shell():
     cfg = {"ssid": "MyHome", "wordlist": "", "jobs": multiprocessing.cpu_count(),
-           "target": "", "cap": "", "hc22000": "", "gpu": "auto"}
+           "target": "", "cap": "", "hc22000": "", "gpu": "auto", "showeach": "off"}
     print("wifi-audit shell — type 'help'. Your own network only.")
     while True:
         try:
@@ -419,14 +511,15 @@ def cmd_shell():
             k, v = a[0].lower(), " ".join(a[1:])
             if k in ("ssid", "wordlist", "target", "cap", "hc22000", "gpu"): cfg[k] = v; print(f"[=] {k}={v}")
             elif k == "jobs": cfg["jobs"] = int(v); print(f"[=] jobs={v}")
-            else: print("[!] set ssid|wordlist|jobs|target|cap|hc22000|gpu")
+            elif k == "showeach" and v.lower() in ("on", "off"): cfg["showeach"] = v.lower(); print(f"[=] showeach={v.lower()}")
+            else: print("[!] set ssid|wordlist|jobs|target|cap|hc22000|gpu|showeach(on|off)")
         elif c == "check":
             if not cfg["wordlist"] or not cfg["target"]: print("[!] set wordlist + target first")
             else: cmd_check_weak(cfg["target"], cfg["wordlist"])
         elif c == "start":
             if not cfg["wordlist"] or not cfg["target"]: print("[!] set wordlist + target first"); continue
             cmd_crack(cfg["ssid"], cfg["wordlist"], target_password=cfg["target"],
-                      jobs=int(cfg["jobs"]), ack=True)
+                      jobs=int(cfg["jobs"]), ack=True, show_each=(cfg["showeach"] == "on"))
         elif c == "audit":
             cmd_audit(cfg["ssid"] or None, cfg["cap"] or None, cfg["hc22000"] or None,
                       cfg["wordlist"], int(cfg["jobs"]), cfg["gpu"], False, True)
@@ -448,7 +541,7 @@ def main():
     sub.add_parser("detect", help="cpu/gpu/tools")
     b = sub.add_parser("benchmark", help="speed test"); b.add_argument("--num-passwords", type=int, default=2000); b.add_argument("--jobs", type=int, default=None); b.add_argument("--ssid", default="TestSSID")
     c = sub.add_parser("check-weak", help="fast list check"); c.add_argument("--current-password", required=True); c.add_argument("--wordlist", required=True)
-    k = sub.add_parser("crack", help="persistent CPU crack until FOUND (lab: your own known password)"); k.add_argument("--ssid", required=True); k.add_argument("--wordlist", required=True); k.add_argument("--target-password", default=None); k.add_argument("--target-pmk", default=None); k.add_argument("--jobs", type=int, default=None); k.add_argument("--resume-from", type=int, default=0); k.add_argument("--batch-size", type=int, default=400); k.add_argument(LEGAL_ACK, dest="i_own", action="store_true")
+    k = sub.add_parser("crack", help="persistent CPU crack until FOUND (lab: your own known password)"); k.add_argument("--ssid", required=True); k.add_argument("--wordlist", required=True); k.add_argument("--target-password", default=None); k.add_argument("--target-pmk", default=None); k.add_argument("--jobs", type=int, default=None); k.add_argument("--resume-from", type=int, default=0); k.add_argument("--batch-size", type=int, default=400); k.add_argument("--show-each", action="store_true", help="log every candidate as [line/total] 'pw' -> WRONG/CORRECT"); k.add_argument(LEGAL_ACK, dest="i_own", action="store_true")
     a = sub.add_parser("audit", help="real handshake audit (persistent)"); a.add_argument("--ssid", default=None); a.add_argument("--cap", default=None); a.add_argument("--hc22000", default=None); a.add_argument("--wordlist", required=True); a.add_argument("--jobs", type=int, default=None); a.add_argument("--use-gpu", choices=["auto", "yes", "no"], default="auto"); a.add_argument("--show", action="store_true"); a.add_argument(LEGAL_ACK, dest="i_own", action="store_true")
     sub.add_parser("shell", help="interactive terminal with commands")
     w = sub.add_parser("wifilist", help="scan nearby APs (passive, no attacks)")
@@ -459,7 +552,7 @@ def main():
     elif args.cmd == "test": cmd_vuln_test(args.ssid, args.wordlist, args.target_password)
     elif args.cmd == "benchmark": cmd_benchmark(args.num_passwords, args.jobs, args.ssid)
     elif args.cmd == "check-weak": cmd_check_weak(args.current_password, args.wordlist)
-    elif args.cmd == "crack": cmd_crack(args.ssid, args.wordlist, args.target_password, args.target_pmk, args.jobs, args.resume_from, args.batch_size, args.i_own)
+    elif args.cmd == "crack": cmd_crack(args.ssid, args.wordlist, args.target_password, args.target_pmk, args.jobs, args.resume_from, args.batch_size, args.i_own, args.show_each)
     elif args.cmd == "audit": cmd_audit(args.ssid, args.cap, args.hc22000, args.wordlist, args.jobs or multiprocessing.cpu_count(), args.use_gpu, args.show, args.i_own)
     elif args.cmd == "shell": cmd_shell()
 

@@ -28,8 +28,9 @@ WA9_HELP = """wa9 - YOUR OWN network only. Passive scan + offline audit, no deau
       Advanced passive vulnerability report (OPEN/WEP/WPA/WPA2/WPA3, WPS checklist,
       default-SSID, passphrase-in-list). No packets injected.
 
-  wa9 'SSID' <wordlist> --target-password '...' --i-own-this-network [--jobs N]
+  wa9 'SSID' <wordlist> --target-password '...' --i-own-this-network [--jobs N] [--show-each]
       Persistent CPU crack until FOUND (lab: your own known password).
+      --show-each logs every try: [line/total] 'password' -> WRONG, CORRECT on hit.
       Example: wa9 'MyHome' rockyou.txt --target-password 'MyOwnPass' --i-own-this-network
 
   wa9 'SSID' <wordlist> --cap own.cap --i-own-this-network
@@ -66,9 +67,17 @@ def main(argv):
         gui = os.path.join(HERE, "wa9_gui.py")
         if not os.path.isfile(gui):
             gui = "/usr/local/lib/wa9/wa9_gui.py"
+        if not os.path.isfile(gui):
+            print("[!] wa9_gui.py not found. Re-run ./install.sh", file=sys.stderr)
+            return 1
         try:
-            subprocess.run([sys.executable, gui] + argv[2:])
-            return 0
+            r = subprocess.run([sys.executable, gui] + argv[2:])
+            if r.returncode == 2:
+                print("[!] GUI needs a display + tkinter. Terminal alternative:\n"
+                      "      wa9 wifilist | wa9 test 'SSID' | wa9 audit --help", file=sys.stderr)
+            return r.returncode
+        except KeyboardInterrupt:
+            return 130
         except Exception as e:
             print(f"[!] GUI failed: {e}\nInstall tkinter: sudo apt install -y python3-tk", file=sys.stderr)
             return 1
@@ -90,6 +99,7 @@ def main(argv):
         p.add_argument("--jobs", type=int, default=None)
         p.add_argument("--resume-from", type=int, default=0)
         p.add_argument("--batch-size", type=int, default=400)
+        p.add_argument("--show-each", action="store_true", help="log every candidate as [line/total] 'pw' -> WRONG/CORRECT")
         p.add_argument("--use-gpu", choices=["auto", "yes", "no"], default="auto")
         p.add_argument("--i-own-this-network", dest="i_own", action="store_true")
         a = p.parse_args(argv[1:])
@@ -99,10 +109,15 @@ def main(argv):
                         a.use_gpu, False, a.i_own)
         else:
             A.cmd_crack(a.ssid, a.wordlist, a.target_password, a.target_pmk,
-                        a.jobs, a.resume_from, a.batch_size, a.i_own)
+                        a.jobs, a.resume_from, a.batch_size, a.i_own, a.show_each)
         return 0
     print(WA9_HELP, file=sys.stderr)
     return 2
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        # Ctrl+C: exit quietly with code 130, no traceback
+        print()
+        sys.exit(130)
