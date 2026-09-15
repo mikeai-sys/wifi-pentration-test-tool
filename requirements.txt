@@ -1,0 +1,2 @@
+# Core is stdlib-only (hashlib, multiprocessing, argparse, tkinter via apt).
+# Add pip packages below if you extend wa9, one per line. install.sh auto-installs them.
