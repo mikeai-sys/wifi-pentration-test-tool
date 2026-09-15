@@ -29,14 +29,19 @@ plus a display. Headless? Use the terminal commands above instead.
 ## IMPORTANT: two modes — read this first
 - **REAL test (`audit`, GUI "Real" mode): actually tests the WiFi password.**
   Needs a handshake capture from YOUR OWN AP (WPA2 can't be tested from the
-  SSID alone — the SSID is not secret). Capture once, then audit offline:
+  SSID alone — the SSID is not secret). Capture it semi-automatically
+  (needs sudo + a monitor-mode-capable adapter; passive listen, NO deauth —
+  you toggle one of your own devices when asked):
   ```bash
-  sudo airmon-ng start wlan0
-  sudo airodump-ng -c <channel> --bssid <your_AP_MAC> -w myown wlan0mon
-  # reconnect one of YOUR OWN devices so the 4-way handshake is captured
-  hcxpcapngtool -o myown.hc22000 myown-01.cap
-  wa9 audit --hc22000 myown.hc22000 --wordlist rockyou.txt --use-gpu auto --i-own-this-network
+  sudo wa9 capture --bssid <your_AP_MAC> --channel <ch> --iface wlan0 --i-own-this-network
+  wa9 audit --hc22000 wa9_capture.hc22000 --wordlist rockyou.txt --use-gpu auto --i-own-this-network
   ```
+  In the GUI (`wa9 auto`) the same flow is a button: **Capture...** asks for
+  your AP's MAC + channel and opens a terminal (pkexec/sudo) running the
+  wizard; afterwards pick the `.hc22000` with Browse and press Start.
+  Manual fallback: `sudo airmon-ng start wlan0`, then
+  `sudo airodump-ng -c <ch> --bssid <MAC> -w myown wlan0mon`,
+  reconnect your own device, `hcxpcapngtool -o myown.hc22000 myown-01.cap`.
   The tool validates the file first and aborts with capture help if the
   handshake is missing/invalid — instead of burning CPU hours on garbage.
 - **LAB demo (`crack`, GUI "Lab" mode): speed/persistence test only.**

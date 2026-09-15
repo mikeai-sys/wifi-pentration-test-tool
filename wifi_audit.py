@@ -3,13 +3,17 @@
 wifi-audit - terminal offline WPA2 auditor for YOUR OWN network.
 
 ONLY for networks you own / have written permission to test.
-No live deauth / monitor-mode / neighbor attack code.
+Passive only: scan + monitor-mode LISTENING on your own AP. No deauth,
+no packet injection, no neighbor attack code — ever.
 
 Commands (terminal tool):
   wifi-audit detect
+  wifi-audit wifilist
+  wifi-audit test 'SSID'
+  wifi-audit capture --bssid <your_AP_MAC> --channel <ch> [--iface wlan0] --i-own-this-network
   wifi-audit benchmark [--num-passwords N] [--jobs N]
   wifi-audit check-weak --current-password X --wordlist f.txt
-  wifi-audit crack --ssid S --wordlist f.txt --target-password Y [--jobs N] [--resume-from N]
+  wifi-audit crack --ssid S --wordlist f.txt --target-password Y [--jobs N] [--show-each]
   wifi-audit audit --ssid S --cap own.cap --wordlist f.txt --i-own-this-network
   wifi-audit audit --hc22000 own.hc22000 --wordlist f.txt --use-gpu auto --i-own-this-network
   wifi-audit shell   # interactive terminal: set/start/status/stop
@@ -386,6 +390,159 @@ from SSID alone — the SSID is not secret):
 Lab shortcut (no WiFi hardware): 'crack' with --target-password replays YOUR OWN
 known password through the engine to prove speed/persistence."""
 
+# ---------------------------------------------------------------------------
+# Passive capture wizard (YOUR OWN AP only).
+# Listens for a handshake while YOU reconnect one of your own devices.
+# Deliberately NO deauth / NO packet injection: it never knocks anyone offline.
+# ---------------------------------------------------------------------------
+def _valid_mac(mac):
+    import re
+    return bool(re.match(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$", (mac or "").strip()))
+
+def _latest_cap(prefix):
+    import glob
+    cands = glob.glob(prefix + "-*.cap")
+    if not cands:
+        return None
+    return max(cands, key=os.path.getmtime)
+
+def _count_eapol(path):
+    """Count EAPOL frames (EtherType 0x888e) in a capture. Pure-python fallback.
+
+    A full WPA2 4-way handshake shows >= 4. Heuristic only — confirmation comes
+    from hcxpcapngtool conversion + validate_handshake().
+    """
+    if which("tshark"):
+        try:
+            r = subprocess.run(["tshark", "-r", path, "-Y", "eapol", "-T", "fields", "-e", "frame.number"],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                return len([l for l in (r.stdout or "").splitlines() if l.strip()])
+        except Exception:
+            pass
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        return data.count(b"\x88\x8e")
+    except OSError:
+        return 0
+
+def _try_convert(cap, out22000):
+    """Convert YOUR OWN capture to hashcat format. Returns True if hashes found."""
+    tool = which("hcxpcapngtool")
+    if not tool or not cap or not os.path.isfile(cap):
+        return False
+    try:
+        if os.path.isfile(out22000):
+            os.remove(out22000)
+        subprocess.run([tool, "-o", out22000, cap],
+                       capture_output=True, timeout=120)
+        return os.path.isfile(out22000) and os.path.getsize(out22000) > 0
+    except Exception:
+        return False
+
+def _mon_iface(iface):
+    """Enable monitor mode, return the monitor interface name (or None)."""
+    try:
+        r = subprocess.run(["airmon-ng", "start", iface],
+                           capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        return None
+    out = (r.stdout or "") + (r.stderr or "")
+    import re
+    m = re.search(r"monitor mode.*?on\s+(?:\[phy\d+\])?(\w+)", out, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    for cand in (iface + "mon", iface):
+        try:
+            r = subprocess.run(["iw", "dev", cand, "info"], capture_output=True, timeout=10)
+            if r.returncode == 0 and "monitor" in (r.stdout or "").lower():
+                return cand
+        except Exception:
+            pass
+    return None
+
+def _stop_mon(mon, phys_iface=None):
+    try:
+        subprocess.run(["airmon-ng", "stop", mon], capture_output=True, timeout=60)
+    except Exception:
+        pass
+    # airmon-ng start usually kills NetworkManager; try to bring it back
+    for cmd in (["systemctl", "start", "NetworkManager"], ["service", "network-manager", "start"]):
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=30)
+            break
+        except Exception:
+            continue
+
+def cmd_capture(iface, bssid, channel, out, timeout, ack):
+    """Passive handshake watch for YOUR OWN AP. No deauth, no injection."""
+    if not ack:
+        fail(f"You must pass {LEGAL_ACK} (your own AP only).")
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        fail("capture needs monitor mode: re-run with sudo, e.g.\n"
+             f"  sudo wa9 capture --bssid {bssid or '<your_AP_MAC>'} --channel {channel or '<ch>'} --iface {iface} {LEGAL_ACK}")
+    if not _valid_mac(bssid):
+        fail(f"bad --bssid '{bssid}'. Use YOUR OWN AP's MAC (router label / admin page), format AA:BB:CC:DD:EE:FF.")
+    try:
+        channel = int(channel)
+        if not 1 <= channel <= 196:
+            raise ValueError
+    except (TypeError, ValueError):
+        fail(f"bad --channel '{channel}'. Use YOUR OWN AP's channel (1-13, 36-64, 100-165...).")
+    if not which("airmon-ng") or not which("airodump-ng"):
+        fail("aircrack-ng suite not found. Install: sudo apt install -y aircrack-ng")
+    print(f"[*] Passive watch on YOUR OWN AP {bssid} ch={channel} iface={iface} (up to {timeout}s).")
+    print("[*] NO deauth will be sent. When asked, toggle YOUR OWN device WiFi off/on.")
+    print("[*] NOTE: airmon-ng stops NetworkManager — your own WiFi drops during capture.")
+    mon = _mon_iface(iface)
+    if not mon:
+        fail(f"could not enable monitor mode on {iface}. Is it a WiFi adapter supporting monitor mode?")
+    print(f"[*] monitor interface: {mon}")
+    dump = None
+    try:
+        dump = subprocess.Popen(["airodump-ng", "-c", str(channel), "--bssid", bssid,
+                                 "-w", out, mon],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        print(f"[*] listening... now reconnect ONE of your own devices (toggle its WiFi off/on).")
+        deadline = time.time() + timeout
+        hc22000 = out + ".hc22000"
+        while time.time() < deadline:
+            time.sleep(10)
+            left = int(deadline - time.time())
+            cap = _latest_cap(out)
+            n = _count_eapol(cap) if cap else 0
+            if cap and n >= 4 and _try_convert(cap, hc22000):
+                ok, msg = validate_handshake(hc22000, "hc22000")
+                if ok:
+                    print(f"\n[+] HANDSHAKE CAPTURED: {msg}")
+                    print(f"[*] files: {cap}  {hc22000}")
+                    print(f"[*] next: wa9 audit --hc22000 {hc22000} --wordlist <wordlist> --use-gpu auto {LEGAL_ACK}")
+                    return hc22000
+            if cap and n >= 4:
+                print(f"[*] {n} EAPOL frames seen, no convertible handshake yet... ({left}s left, toggle your device again)")
+            else:
+                print(f"[*] waiting for handshake... ({left}s left — toggle YOUR OWN device WiFi off/on)")
+        print(f"\n[-] Timeout: no convertible handshake in {timeout}s.")
+        print("    It only appears when one of YOUR OWN devices (re)connects while we listen.")
+        print("    Retry with the device next to the AP, or check --bssid/--channel.")
+        return None
+    except KeyboardInterrupt:
+        print("\n[!] Stopped by user.")
+        return None
+    finally:
+        if dump and dump.poll() is None:
+            try:
+                os.killpg(os.getpgid(dump.pid), 15)
+            except Exception:
+                try:
+                    dump.terminate()
+                except Exception:
+                    pass
+        _stop_mon(mon, iface)
+        print("[*] monitor mode stopped.")
+
 def validate_handshake(path, kind=None):
     """Check an offline capture is usable before burning CPU/GPU hours.
 
@@ -483,6 +640,7 @@ SHELL_HELP = """commands:
   check                         is target in wordlist? (fast, no crypto)
   start                         persistent crack until FOUND (CPU, lab simulation)
   audit                         real handshake audit via aircrack/hashcat until done
+  capture                       prints the passive capture command (needs sudo terminal)
   exit
 notes: start/audit never stop after a few tries — only FOUND / exhausted / Ctrl+C / 'exit'.
 """
@@ -523,6 +681,10 @@ def cmd_shell():
         elif c == "audit":
             cmd_audit(cfg["ssid"] or None, cfg["cap"] or None, cfg["hc22000"] or None,
                       cfg["wordlist"], int(cfg["jobs"]), cfg["gpu"], False, True)
+        elif c == "capture":
+            print("Run in a sudo terminal (needs monitor mode, YOUR OWN AP only, no deauth sent):\n"
+                  "  sudo wa9 capture --bssid <your_AP_MAC> --channel <ch> --iface wlan0 --i-own-this-network\n"
+                  "Then: set cap <file> (or set hc22000 <file>) + audit")
         elif c == "status":
             ck = open(CHECKPOINT).read().strip() if os.path.isfile(CHECKPOINT) else "none"
             print(f"cfg={cfg} checkpoint={ck}")
@@ -546,8 +708,10 @@ def main():
     sub.add_parser("shell", help="interactive terminal with commands")
     w = sub.add_parser("wifilist", help="scan nearby APs (passive, no attacks)")
     t = sub.add_parser("test", help="advanced passive vuln assessment of YOUR OWN ssid"); t.add_argument("ssid"); t.add_argument("--wordlist", default=None); t.add_argument("--target-password", default=None)
+    p = sub.add_parser("capture", help="passive handshake watch on YOUR OWN AP (no deauth)"); p.add_argument("--bssid", required=True, help="YOUR OWN AP MAC, AA:BB:CC:DD:EE:FF"); p.add_argument("--channel", required=True, help="YOUR OWN AP channel"); p.add_argument("--iface", default="wlan0"); p.add_argument("--out", default="wa9_capture"); p.add_argument("--timeout", type=int, default=300); p.add_argument(LEGAL_ACK, dest="i_own", action="store_true")
     args = ap.parse_args()
     if args.cmd == "detect": cmd_detect()
+    elif args.cmd == "capture": cmd_capture(args.iface, args.bssid, args.channel, args.out, args.timeout, args.i_own)
     elif args.cmd == "wifilist": cmd_wifilist()
     elif args.cmd == "test": cmd_vuln_test(args.ssid, args.wordlist, args.target_password)
     elif args.cmd == "benchmark": cmd_benchmark(args.num_passwords, args.jobs, args.ssid)

@@ -28,6 +28,10 @@ WA9_HELP = """wa9 - YOUR OWN network only. Passive scan + offline audit, no deau
       Advanced passive vulnerability report (OPEN/WEP/WPA/WPA2/WPA3, WPS checklist,
       default-SSID, passphrase-in-list). No packets injected.
 
+  wa9 capture --bssid <your_AP_MAC> --channel <ch> [--iface wlan0] --i-own-this-network
+      Passive handshake watch on YOUR OWN AP (needs sudo for monitor mode).
+      Listens until YOU reconnect one of your own devices. NO deauth sent.
+
   wa9 'SSID' <wordlist> --target-password '...' --i-own-this-network [--jobs N] [--show-each]
       Persistent CPU crack until FOUND (lab: your own known password).
       --show-each logs every try: [line/total] 'password' -> WRONG, CORRECT on hit.
@@ -39,7 +43,7 @@ WA9_HELP = """wa9 - YOUR OWN network only. Passive scan + offline audit, no deau
   wa9 auto
       Open GUI: pick WiFi, choose wordlist file, start.
 
-  wa9 shell | detect | benchmark | crack | audit | wifilist | test
+  wa9 shell | detect | benchmark | crack | audit | capture | wifilist | test
       Full passthrough to wifi-audit.
 """
 
@@ -81,7 +85,7 @@ def main(argv):
         except Exception as e:
             print(f"[!] GUI failed: {e}\nInstall tkinter: sudo apt install -y python3-tk", file=sys.stderr)
             return 1
-    if c in ("shell", "detect", "benchmark", "check-weak", "crack", "audit", "wifilist", "test"):
+    if c in ("shell", "detect", "benchmark", "check-weak", "crack", "audit", "capture", "wifilist", "test"):
         base = os.path.join(HERE, "wifi_audit.py")
         if not os.path.isfile(base):
             base = "/usr/local/lib/wa9/wifi_audit.py"

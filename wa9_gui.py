@@ -12,6 +12,7 @@ Real audit additionally needs aircrack-ng and/or hashcat (see backend line).
 """
 import os
 import queue
+import shutil
 import signal
 import subprocess
 import sys
@@ -108,6 +109,8 @@ class App(tk.Tk):
         ttk.Button(btns, text="Test vulns", command=self.test).pack(side="left", padx=4)
         ttk.Button(btns, text="Start (until FOUND)", command=self.start).pack(side="left", padx=4)
         ttk.Button(btns, text="Stop", command=self.stop).pack(side="left", padx=4)
+        ttk.Button(btns, text="Capture...", command=self.capture).pack(side="left", padx=4)
+        ttk.Button(btns, text="Capture help", command=self.capture_help).pack(side="left", padx=4)
 
         self.log = tk.Text(frm, height=16, wrap="word")
         self.log.grid(row=9, column=0, columnspan=3, sticky="nsew")
@@ -201,6 +204,86 @@ class App(tk.Tk):
                     buf.write(f"[!] {e}\n")
             self.emit(buf.getvalue())
         threading.Thread(target=work, daemon=True).start()
+
+    def capture_help(self):
+        self.emit(
+            "[*] To get the handshake file for REAL mode (YOUR OWN AP only):\n"
+            "    press Capture... (opens a terminal with sudo), or run:\n"
+            "      sudo wa9 capture --bssid <your_AP_MAC> --channel <ch> --iface wlan0 --i-own-this-network\n"
+            "    It listens passively (NO deauth). Toggle YOUR OWN device WiFi off/on\n"
+            "    when asked, then pick the resulting .cap/.hc22000 above with Browse.\n")
+
+    def capture(self):
+        """Dialog for YOUR OWN AP, then launch the passive wizard in a terminal
+        (monitor mode needs root; no deauth is ever sent)."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Capture handshake (your own AP)")
+        dlg.transient(self)
+        ttk.Label(dlg, text="AP MAC (router label):").grid(row=0, column=0, sticky="w", padx=8, pady=4)
+        bssid = tk.StringVar()
+        ttk.Entry(dlg, textvariable=bssid, width=20).grid(row=0, column=1, padx=8, pady=4)
+        ttk.Label(dlg, text="Channel:").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        ch = tk.StringVar()
+        ttk.Entry(dlg, textvariable=ch, width=8).grid(row=1, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(dlg, text="Interface:").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        iface = tk.StringVar(value="wlan0")
+        ttk.Entry(dlg, textvariable=iface, width=12).grid(row=2, column=1, sticky="w", padx=8, pady=4)
+        own = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dlg, text="I own this AP / have written permission",
+                        variable=own).grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+        ttk.Label(dlg, text="Opens a terminal asking for admin rights. Passive listen only.",
+                  foreground="gray").grid(row=4, column=0, columnspan=2, padx=8, pady=4)
+
+        def go():
+            m, c, i = bssid.get().strip(), ch.get().strip(), iface.get().strip() or "wlan0"
+            if not own.get():
+                messagebox.showwarning("wa9", "Confirm you own this AP first.", parent=dlg)
+                return
+            if not A._valid_mac(m):
+                messagebox.showwarning("wa9", "Bad AP MAC. Use AA:BB:CC:DD:EE:FF from your router label.", parent=dlg)
+                return
+            try:
+                if not 1 <= int(c) <= 196:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("wa9", "Bad channel.", parent=dlg)
+                return
+            dlg.destroy()
+            self._launch_capture(m, c, i)
+
+        ttk.Button(dlg, text="Start capture", command=go).grid(row=5, column=0, padx=8, pady=8)
+        ttk.Button(dlg, text="Cancel", command=dlg.destroy).grid(row=5, column=1, padx=8, pady=8)
+        dlg.grab_set()
+
+    def _launch_capture(self, bssid, channel, iface):
+        wa9bin = shutil.which("wa9")
+        if wa9bin:
+            inner = [wa9bin, "capture", "--bssid", bssid, "--channel", channel,
+                     "--iface", iface, "--i-own-this-network"]
+        else:
+            inner = [sys.executable, self._base_script(), "capture", "--bssid", bssid,
+                     "--channel", channel, "--iface", iface, "--i-own-this-network"]
+        if shutil.which("pkexec"):
+            root_cmd = ["pkexec"] + inner
+        elif shutil.which("sudo"):
+            root_cmd = ["sudo", "-E"] + inner
+        else:
+            messagebox.showwarning("wa9", "Need pkexec or sudo for monitor mode.")
+            self.emit("[!] No pkexec/sudo found. Run in a terminal:\n  sudo wa9 capture --bssid <MAC> --channel <ch> --i-own-this-network\n")
+            return
+        terms = (("gnome-terminal", ["--"]), ("konsole", ["-e"]),
+                 ("xfce4-terminal", ["-e"]), ("xterm", ["-e"]))
+        for term, join in terms:
+            if shutil.which(term):
+                try:
+                    subprocess.Popen([term] + join + root_cmd, start_new_session=True)
+                except Exception as e:
+                    messagebox.showwarning("wa9", f"Could not open terminal:\n{e}")
+                    return
+                self.emit("[*] Capture opened in a terminal — toggle YOUR OWN device WiFi when asked,\n"
+                          "    then pick the resulting .cap/.hc22000 above with Browse.\n")
+                return
+        self.emit("[*] No terminal emulator found. Run this in a terminal:\n  sudo " + " ".join(inner) + "\n")
 
     def _base_script(self):
         base = os.path.join(HERE, "wifi_audit.py")
