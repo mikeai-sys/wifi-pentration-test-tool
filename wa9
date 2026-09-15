@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""wa9 - global shorthand for wifi-audit (YOUR OWN network only).
+
+Usage:
+  wa9 wifilist
+  wa9 test 'SSID' [--wordlist f.txt --target-password '...']
+  wa9 auto
+  wa9 'SSID' <wordlist> [--target-password '...'] [--jobs N] [--resume-from N] [--i-own-this-network]
+  wa9 'SSID' <wordlist> --cap own.cap --i-own-this-network
+  wa9 crack|audit|benchmark|detect|shell|wifilist|test ...   (passthrough)
+"""
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, "/usr/local/lib/wa9")
+
+import wifi_audit as A
+
+WA9_HELP = """wa9 - YOUR OWN network only. Passive scan + offline audit, no deauth/attacks.
+
+  wa9 wifilist
+      List nearby APs (passive nmcli/iwlist scan).
+
+  wa9 test 'SSID' [--wordlist f --target-password '...']
+      Advanced passive vulnerability report (OPEN/WEP/WPA/WPA2/WPA3, WPS checklist,
+      default-SSID, passphrase-in-list). No packets injected.
+
+  wa9 'SSID' <wordlist> --target-password '...' --i-own-this-network [--jobs N]
+      Persistent CPU crack until FOUND (lab: your own known password).
+      Example: wa9 'MyHome' rockyou.txt --target-password 'MyOwnPass' --i-own-this-network
+
+  wa9 'SSID' <wordlist> --cap own.cap --i-own-this-network
+      Real handshake audit via aircrack-ng (full file, persistent).
+
+  wa9 auto
+      Open GUI: pick WiFi, choose wordlist file, start.
+
+  wa9 shell | detect | benchmark | crack | audit | wifilist | test
+      Full passthrough to wifi-audit.
+"""
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        print(WA9_HELP)
+        return 0
+    c = argv[1]
+    if c == "wifilist":
+        A.cmd_wifilist()
+        return 0
+    if c == "test":
+        if len(argv) < 3:
+            print("Usage: wa9 test 'SSID' [--wordlist f --target-password '...']", file=sys.stderr)
+            return 2
+        ssid, wl, tp = argv[2], None, None
+        for i, x in enumerate(argv[3:]):
+            if x == "--wordlist" and i + 4 <= len(argv):
+                wl = argv[3 + i + 1]
+            if x == "--target-password" and i + 4 <= len(argv):
+                tp = argv[3 + i + 1]
+        A.cmd_vuln_test(ssid, wl, tp)
+        return 0
+    if c == "auto":
+        gui = os.path.join(HERE, "wa9_gui.py")
+        if not os.path.isfile(gui):
+            gui = "/usr/local/lib/wa9/wa9_gui.py"
+        try:
+            subprocess.run([sys.executable, gui] + argv[2:])
+            return 0
+        except Exception as e:
+            print(f"[!] GUI failed: {e}\nInstall tkinter: sudo apt install -y python3-tk", file=sys.stderr)
+            return 1
+    if c in ("shell", "detect", "benchmark", "check-weak", "crack", "audit", "wifilist", "test"):
+        base = os.path.join(HERE, "wifi_audit.py")
+        if not os.path.isfile(base):
+            base = "/usr/local/lib/wa9/wifi_audit.py"
+        os.execvp(sys.executable, [sys.executable, base] + argv[1:])
+    # shorthand: wa9 'SSID' <wordlist> [opts]
+    if len(argv) >= 3 and os.path.isfile(argv[2]):
+        import argparse
+        p = argparse.ArgumentParser(prog="wa9 'SSID' wordlist")
+        p.add_argument("ssid")
+        p.add_argument("wordlist")
+        p.add_argument("--target-password", default=None)
+        p.add_argument("--target-pmk", default=None)
+        p.add_argument("--cap", default=None)
+        p.add_argument("--hc22000", default=None)
+        p.add_argument("--jobs", type=int, default=None)
+        p.add_argument("--resume-from", type=int, default=0)
+        p.add_argument("--batch-size", type=int, default=400)
+        p.add_argument("--use-gpu", choices=["auto", "yes", "no"], default="auto")
+        p.add_argument("--i-own-this-network", dest="i_own", action="store_true")
+        a = p.parse_args(argv[1:])
+        if a.cap or a.hc22000:
+            A.cmd_audit(a.ssid, a.cap, a.hc22000, a.wordlist,
+                        a.jobs or __import__("multiprocessing").cpu_count(),
+                        a.use_gpu, False, a.i_own)
+        else:
+            A.cmd_crack(a.ssid, a.wordlist, a.target_password, a.target_pmk,
+                        a.jobs, a.resume_from, a.batch_size, a.i_own)
+        return 0
+    print(WA9_HELP, file=sys.stderr)
+    return 2
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
